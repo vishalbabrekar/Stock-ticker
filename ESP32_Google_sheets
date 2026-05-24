@@ -1,0 +1,275 @@
+#include <Arduino_GFX_Library.h>
+#include <SPI.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// --- WiFi Credentials ---
+const char* ssid = "babrekar2";
+const char* password = "Shiva@213029";
+
+// --- Google Sheet CSV URL ---
+// Replace this with your published Google Sheet CSV URL
+const String csvUrl = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ-UBpnLrpHnN14mqlxcPPC4AWK5EIYttpzm1kmm8PRo5OmcVd3vFZGqBphT3ULi3Rg85mWkPV84Qn4/pub?gid=0&single=true&output=csv";
+
+// --- Stock Data Structure ---
+struct Stock {
+  String symbol;
+  String price;
+  String change;
+};
+
+const int MAX_STOCKS = 50;
+Stock stockList[MAX_STOCKS];
+int stockCount = 0;
+
+// --- Column Mapping Variables ---
+// These will be auto-detected from the CSV header row
+int symbolCol = -1;
+int priceCol = -1;
+int changeCol = -1;
+
+// --- Hardware Display Configuration ---
+Arduino_DataBus *bus = new Arduino_HWSPI(
+  2,     // DC Pin
+  15,    // CS Pin
+  18,    // SCLK Pin
+  23,    // MOSI (SDA Pin)
+  -1,    // MISO (Unused)
+  &SPI,  // Direct pointer to ESP32 Hardware SPI Instance
+  false  // Not a shared interface
+);
+
+Arduino_GFX *gfx = new Arduino_ST7789(
+  bus, 
+  4,     // RST Pin
+  0,     // CRITICAL: Set to 0 (Native Portrait) here to prevent text skewing
+  true,  // Is IPS Screen
+  76,    // Native Width
+  284,   // Native Height
+  82,    // Portrait Column Shift Offset
+  18,    // Portrait Row Shift Offset
+  82,    // Max boundary mapping configuration
+  18
+);
+
+// --- Helper function to parse CSV lines safely ---
+String getValueFromRow(String row, int targetIndex) {
+  int currentIndex = 0;
+  int startPos = 0;
+  
+  while (currentIndex <= targetIndex) {
+    int endPos = row.indexOf(',', startPos);
+    
+    // Handle the last item in the row
+    if (endPos == -1) {
+      if (currentIndex == targetIndex) {
+        String val = row.substring(startPos);
+        val.trim();
+        // Strip out accidental enclosing quotes from CSV format
+        if(val.startsWith("\"") && val.endsWith("\"")) val = val.substring(1, val.length()-1);
+        return val;
+      }
+      break;
+    }
+    
+    if (currentIndex == targetIndex) {
+      String val = row.substring(startPos, endPos);
+      val.trim();
+      if(val.startsWith("\"") && val.endsWith("\"")) val = val.substring(1, val.length()-1);
+      return val;
+    }
+    
+    startPos = endPos + 1;
+    currentIndex++;
+  }
+  return "";
+}
+
+// --- Function to fetch and parse Google Sheet CSV Data ---
+bool fetchStockData() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi Disconnected!");
+    return false;
+  }
+
+  gfx->fillScreen(0x0000);
+  gfx->setTextSize(1);
+  gfx->setTextColor(0xFFFF); // White
+  gfx->setCursor(10, 30);
+  gfx->println("Updating Data from Google Sheet...");
+
+  HTTPClient http;
+  // Google Sheets forces a redirect (302), HTTPClient handles it if told to follow redirects
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(csvUrl);
+  
+  int httpCode = http.GET();
+  if (httpCode <= 0) {
+    Serial.printf("HTTP GET failed, error: %s\n", http.errorToString(httpCode).c_str());
+    http.end();
+    return false;
+  }
+
+  // Read data line by line to handle 50 rows safely without running out of RAM
+  WiFiClient* stream = http.getStreamPtr();
+  stockCount = 0;
+  bool isHeader = true;
+
+  while (http.connected() && stream->available() && stockCount < MAX_STOCKS) {
+    String line = stream->readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    // Process the header line to locate column indices dynamically
+    if (isHeader) {
+      int colIndex = 0;
+      String headerToken;
+      while ((headerToken = getValueFromRow(line, colIndex)) != "") {
+        headerToken.toLowerCase();
+        if (headerToken.indexOf("symbol") != -1) symbolCol = colIndex;
+        else if (headerToken.indexOf("price") != -1) priceCol = colIndex;
+        else if (headerToken.indexOf("change") != -1) changeCol = colIndex;
+        colIndex++;
+      }
+      
+      // Fallback defaults if columns aren't named explicitly
+      if (symbolCol == -1) symbolCol = 0; 
+      if (changeCol == -1) changeCol = 1;
+      if (priceCol == -1) priceCol = 2;
+
+      isHeader = false;
+      continue;
+    }
+
+    // Process rows
+    String sym = getValueFromRow(line, symbolCol);
+    String prc = getValueFromRow(line, priceCol);
+    String chg = getValueFromRow(line, changeCol);
+
+    if (sym != "") {
+      stockList[stockCount].symbol = sym;
+      stockList[stockCount].price = prc;
+      stockList[stockCount].change = chg;
+      stockCount++;
+    }
+  }
+
+  http.end();
+  return stockCount > 0;
+}
+
+// --- Function to display a stock layout nicely on the 284x76 screen ---
+void displayStock(Stock stock) {
+  gfx->fillScreen(0x0000); // Clear Screen Black
+
+  // Draw clean, dark gray boundary box
+  gfx->drawRect(0, 0, 284, 76, 0x4A49); 
+
+  // Determine direction, strip clean string, and assign color themes
+  bool isNegative = (stock.change.indexOf('-') != -1);
+  uint16_t themeColor = isNegative ? 0xF800 : 0x07E0; // Red if negative, Green if positive
+
+  // Strip out any existing symbols like '+', '-', or '%' if present to prevent rendering overlaps
+  String cleanChange = stock.change;
+  cleanChange.replace("-", "");
+  cleanChange.replace("+", "");
+  cleanChange.replace("%", "");
+  cleanChange += "%"; // Re-append clean % trailing sign
+
+  // 1. Stock Name (Upper Left Corner)
+  gfx->setTextColor(0xFFFF); // White
+  gfx->setTextSize(3);
+  gfx->setCursor(10, 12);
+  gfx->print(stock.symbol);
+
+  // 2. Stock Price (Bright Yellow)
+  gfx->setTextColor(0xFFE0); 
+  gfx->setTextSize(3);
+  gfx->setCursor(10, 46);
+  gfx->print(stock.price);
+
+  // 3. Percentage Change Text (Lower Right Corner)
+  gfx->setTextSize(3);
+  gfx->setTextColor(themeColor);
+  
+  // Right alignment calculation for Size 3 text (Each character is 18px wide)
+  int textWidth = cleanChange.length() * 18;
+  int changeX = 274 - textWidth; 
+  
+  gfx->setCursor(changeX, 46); // Y baseline at 46
+  gfx->print(cleanChange);
+
+  // 4. Dynamic Geometric Trend Arrow Indicator (Perfected Alignment)
+  // An arrow width of 14px + an 18px text space (1 character width) = 32px offset
+  int arrowBaseX = changeX - 32; 
+  
+  if (!isNegative) {
+    // Solid UP Arrow (Shifted down to align flush with text baseline)
+    gfx->fillTriangle(
+      arrowBaseX + 7,  49,  // Top apex vertex
+      arrowBaseX,      67,  // Bottom left vertex
+      arrowBaseX + 14, 67,  // Bottom right vertex
+      0x07E0                // Green
+    );
+  } else {
+    // Solid DOWN Arrow (Shifted down to align flush with text baseline)
+    gfx->fillTriangle(
+      arrowBaseX + 7,  67,  // Bottom apex vertex
+      arrowBaseX,      49,  // Top left vertex
+      arrowBaseX + 14, 49,  // Top right vertex
+      0xF800                // Red
+    );
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Hardware Reset Screen 
+  pinMode(4, OUTPUT);
+  digitalWrite(4, LOW);
+  delay(100);
+  digitalWrite(4, HIGH);
+  delay(100);
+
+  // Initialize GFX pipeline
+  gfx->begin();
+  gfx->displayOn();
+  gfx->invertDisplay(true); 
+  gfx->setRotation(1); // Landscape mode 284x76
+
+  gfx->fillScreen(0x0000);
+  gfx->setTextColor(0xFFFF);
+  gfx->setTextSize(2);
+  gfx->setCursor(20, 28);
+  gfx->println("Connecting WiFi...");
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected!");
+}
+
+void loop() {
+  // 1. Fetch updated data from Google Sheet
+  if (fetchStockData()) {
+    Serial.printf("Successfully loaded %d entries.\n", stockCount);
+    
+    // 2. Loop through all fetched stocks, flashing each for 5 seconds
+    for (int i = 0; i < stockCount; i++) {
+      displayStock(stockList[i]);
+      delay(5000); // 5 Seconds Flash Delay
+    }
+  } else {
+    Serial.println("Fetch failed. Retrying in 10 seconds...");
+    gfx->fillScreen(0x0000);
+    gfx->setTextColor(0xF800); // Red Error
+    gfx->setTextSize(1);
+    gfx->setCursor(10, 30);
+    gfx->println("Fetch Failed. Retrying...");
+    delay(10000); 
+  }
+}
