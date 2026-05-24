@@ -178,7 +178,7 @@ void displayStock(Stock stock) {
 
   // 1. Stock Name (Upper Left Corner)
   gfx->setTextColor(0xFFFF); // White
-  gfx->setTextSize(3);
+  gfx->setTextSize(4);
   gfx->setCursor(10, 12);
   gfx->print(stock.symbol);
 
