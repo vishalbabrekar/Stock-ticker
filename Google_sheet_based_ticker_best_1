@@ -1,0 +1,294 @@
+#include <U8g2lib.h> // CRITICAL: Must be included BEFORE Arduino_GFX
+#include <Arduino_GFX_Library.h>
+#include <SPI.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// --- WiFi Credentials ---
+const char* ssid = "babrekar2";
+const char* password = "Shiva@213029";
+
+// --- Google Sheet CSV URL ---
+const String csvUrl = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ-UBpnLrpHnN14mqlxcPPC4AWK5EIYttpzm1kmm8PRo5OmcVd3vFZGqBphT3ULi3Rg85mWkPV84Qn4/pub?gid=0&single=true&output=csv";
+
+// --- Stock Data Structure ---
+struct Stock {
+  String symbol;
+  String price;
+  String change;
+};
+
+const int MAX_STOCKS = 50;
+Stock stockList[MAX_STOCKS];
+int stockCount = 0;
+
+// --- Column Mapping Variables ---
+int symbolCol = -1;
+int priceCol = -1;
+int changeCol = -1;
+
+// --- Hardware Display Configuration ---
+Arduino_DataBus *bus = new Arduino_HWSPI(
+  2,     // DC Pin
+  15,    // CS Pin
+  18,    // SCLK Pin
+  23,    // MOSI (SDA Pin)
+  -1,    // MISO (Unused)
+  &SPI,  // Direct pointer to ESP32 Hardware SPI Instance
+  false  // Not a shared interface
+);
+
+Arduino_GFX *gfx = new Arduino_ST7789(
+  bus, 
+  4,     // RST Pin
+  0,     // Native Portrait setup
+  true,  // Is IPS Screen
+  76,    // Native Width
+  284,   // Native Height
+  82,    // Portrait Column Shift Offset
+  18,    // Portrait Row Shift Offset
+  82,    // Max boundary mapping configuration
+  18
+);
+
+// --- Helper function to parse CSV lines safely ---
+String getValueFromRow(String row, int targetIndex) {
+  int currentIndex = 0;
+  int startPos = 0;
+  
+  while (currentIndex <= targetIndex) {
+    int endPos = row.indexOf(',', startPos);
+    
+    if (endPos == -1) {
+      if (currentIndex == targetIndex) {
+        String val = row.substring(startPos);
+        val.trim();
+        if(val.startsWith("\"") && val.endsWith("\"")) val = val.substring(1, val.length()-1);
+        return val;
+      }
+      break;
+    }
+    
+    if (currentIndex == targetIndex) {
+      String val = row.substring(startPos, endPos);
+      val.trim();
+      if(val.startsWith("\"") && val.endsWith("\"")) val = val.substring(1, val.length()-1);
+      return val;
+    }
+    
+    startPos = endPos + 1;
+    currentIndex++;
+  }
+  return "";
+}
+
+// --- Function to fetch and parse Google Sheet CSV Data ---
+bool fetchStockData() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi Disconnected!");
+    return false;
+  }
+
+  gfx->fillScreen(0x0000);
+  gfx->setFont(u8g2_font_helvB14_tf); // Use smooth font for system messages
+  gfx->setTextColor(0xFFFF); 
+  gfx->setCursor(10, 45); // Y adjusted down for baseline structure
+  gfx->println("Updating Data...");
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(csvUrl);
+  
+  int httpCode = http.GET();
+  if (httpCode <= 0) {
+    Serial.printf("HTTP GET failed, error: %s\n", http.errorToString(httpCode).c_str());
+    http.end();
+    return false;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+  stockCount = 0;
+  bool isHeader = true;
+
+  while (http.connected() && stream->available() && stockCount < MAX_STOCKS) {
+    String line = stream->readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    if (isHeader) {
+      int colIndex = 0;
+      String headerToken;
+      while ((headerToken = getValueFromRow(line, colIndex)) != "") {
+        headerToken.toLowerCase();
+        if (headerToken.indexOf("symbol") != -1) symbolCol = colIndex;
+        else if (headerToken.indexOf("price") != -1) priceCol = colIndex;
+        else if (headerToken.indexOf("change") != -1) changeCol = colIndex;
+        colIndex++;
+      }
+      
+      if (symbolCol == -1) symbolCol = 0; 
+      if (changeCol == -1) changeCol = 1;
+      if (priceCol == -1) priceCol = 2;
+
+      isHeader = false;
+      continue;
+    }
+
+    String sym = getValueFromRow(line, symbolCol);
+    String prc = getValueFromRow(line, priceCol);
+    String chg = getValueFromRow(line, changeCol);
+
+    if (sym != "") {
+      stockList[stockCount].symbol = sym;
+      stockList[stockCount].price = prc;
+      stockList[stockCount].change = chg;
+      stockCount++;
+    }
+  }
+
+  http.end();
+  return stockCount > 0;
+}
+
+// --- Custom Helper Function to print text with manual horizontal spacing ---
+void printSpaciousString(const String &text, int16_t x, int16_t y, uint8_t trackingPixels) {
+  gfx->setCursor(x, y);
+  for (uint16_t i = 0; i < text.length(); i++) {
+    char c = text.charAt(i);
+    gfx->print(c);
+    
+    // Advance the cursor by tracking pixels after printing each character
+    int16_t nextX = gfx->getCursorX() + trackingPixels;
+    gfx->setCursor(nextX, y);
+  }
+}
+
+// --- Function to display a stock layout nicely on the 284x76 screen ---
+void displayStock(Stock stock) {
+  gfx->fillScreen(0x0000); 
+
+  // Draw clean, dark gray boundary box (0 to 75 Y-axis bounds)
+  //gfx->drawRect(0, 0, 284, 76, 0x4A49); 
+
+  bool isNegative = (stock.change.indexOf('-') != -1);
+  uint16_t themeColor = isNegative ? 0xF9A0 : 0x07E0; 
+
+  String cleanChange = stock.change;
+  cleanChange.replace("-", "");
+  cleanChange.replace("+", "");
+  cleanChange.replace("%", "");
+  cleanChange += "%"; 
+
+  // --- CRITICAL REMINDER: gfx->setTextSize() MUST remain at 1 when using U8g2 fonts! ---
+  gfx->setTextSize(1); 
+
+  // =========================================================================
+  // 1. Stock Name (Upper Left Corner) - EXTRA SPACIOUS (4px Tracking)
+  // =========================================================================
+  gfx->setFont(u8g2_font_helvB24_tf);      
+  gfx->setTextColor(0xFFFF); 
+  // Stepped up from 3px to 4px horizontal tracking for a wide, premium look
+  printSpaciousString(stock.symbol, 14, 32, 4);
+
+  // =========================================================================
+  // 2. Stock Price (Bright Yellow) - Aligned to Lower Boundary
+  // =========================================================================
+  gfx->setFont(u8g2_font_helvB18_tf); 
+  gfx->setTextColor(0xFFFF); 
+  printSpaciousString(stock.price, 14, 64, 4);
+
+  // =========================================================================
+  // 3. Percentage Change (Lower Right Corner) - NEW FUTURA BOLD FONT
+  // =========================================================================
+  gfx->setFont(u8g2_font_fub20_tf); // High-readability Futura Bold 20px font
+  gfx->setTextColor(themeColor);
+  
+  // Calculate dynamic text width using built-in library metrics
+  int16_t x1, y1;
+  uint16_t w, h;
+  gfx->getTextBounds(cleanChange, 0, 0, &x1, &y1, &w, &h);
+  
+  // 3px tracking looks excellent on the geometric structures of Futura
+  uint8_t percentageTracking = 3;
+  int extraTrackingWidth = (cleanChange.length() - 1) * percentageTracking;
+  int changeX = 270 - (w + extraTrackingWidth); 
+  
+  // Y baseline 64 keeps it perfectly flushed against the bottom edge
+  printSpaciousString(cleanChange, changeX, 64, percentageTracking);
+
+  // =========================================================================
+  // 4. Dynamic Geometric Trend Arrow Indicator - Aligned to Lower Boundary
+  // =========================================================================
+  // Positioned slightly to the left of the new Futura text block
+  int arrowBaseX = changeX - 24; 
+  
+  if (!isNegative) {
+    // Solid UP Arrow touching the bottom border line cleanly (base at Y=64)
+    gfx->fillTriangle(
+      arrowBaseX + 7,  44,  // Top apex vertex
+      arrowBaseX,      64,  // Bottom left vertex
+      arrowBaseX + 14, 64,  // Bottom right vertex
+      0x07E0                
+    );
+  } else {
+    // Solid DOWN Arrow touching the bottom border line cleanly (apex at Y=64)
+    gfx->fillTriangle(
+      arrowBaseX + 7,  64,  // Bottom apex vertex
+      arrowBaseX,      44,  // Top left vertex
+      arrowBaseX + 14, 44,  // Top right vertex
+      0xF800                
+    );
+  }
+}
+
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(4, OUTPUT);
+  digitalWrite(4, LOW);
+  delay(100);
+  digitalWrite(4, HIGH);
+  delay(100);
+
+  gfx->begin();
+  gfx->displayOn();
+  gfx->invertDisplay(true); 
+  gfx->setRotation(1); 
+
+  gfx->fillScreen(0x0000);
+  
+  // Set initial smooth font for bootup loading screen
+  gfx->setFont(u8g2_font_helvB14_tf);
+  gfx->setTextColor(0xFFFF);
+  gfx->setTextSize(1);
+  gfx->setCursor(20, 45);
+  gfx->println("Connecting WiFi...");
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected!");
+}
+
+void loop() {
+  if (fetchStockData()) {
+    Serial.printf("Successfully loaded %d entries.\n", stockCount);
+    
+    for (int i = 0; i < stockCount; i++) {
+      displayStock(stockList[i]);
+      delay(5000); 
+    }
+  } else {
+    Serial.println("Fetch failed. Retrying in 10 seconds...");
+    gfx->fillScreen(0x0000);
+    gfx->setFont(u8g2_font_helvB14_tf);
+    gfx->setTextColor(0xF800); 
+    gfx->setTextSize(1);
+    gfx->setCursor(15, 45);
+    gfx->println("Fetch Failed. Retrying...");
+    delay(10000); 
+  }
+}
