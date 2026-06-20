@@ -1,0 +1,199 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h> 
+#include <LovyanGFX.hpp>
+
+const char* ssid = "babrekar2";
+const char* password = "Shiva@213029";
+const String proxyUrl = "https://script.googleusercontent.com/macros/echo?user_content_key=AUkAhnQclUCYrwrGPHa3WQyM63FJBZ4tNClw1aoEtHUYZdXkZU12l_vVlpV713OEf5awnEk2tRAJPqf8Da6N0BrDeKHF1mm71rjaBD95Z0ziC81KzUksma2HvXyiDo5WhY4rWDtZL1R-3hO1rIS3XW87OP0E9tWJKRiysxEExGyvP6DQP9GG6OXhjlejo6XGY708niPqCA4WtK_XY_Cu2qX2ugWPQrnmmn7NmTJHdeQs_-Ic0JzBVqc8N9ZuTgeTe4nQqsTmQwTIoWmRJBiycl50Z9Z6k_zZ2Q&lib=Mqty50rT3sejr36IxI9Qfv-xcidNq9sUk";
+
+struct Stock { String symbol, price, change; };
+Stock niftyList[50]; int niftyCount = 0;
+Stock babaList[100]; int babaCount = 0;
+Stock aaiList[100];  int aaiCount = 0;
+
+Stock shadowNifty[50]; int shadowNiftyCount = 0;
+Stock shadowBaba[100]; int shadowBabaCount = 0;
+Stock shadowAai[100];  int shadowAaiCount = 0;
+
+volatile bool initialDataLoaded = false; 
+volatile bool dataNeedsUpdate = false; // Flag to tell Core 1 to refresh the layout safely
+unsigned long lastTopSwitchTime = 0;
+int currentBabaIndex = 0; int currentAaiIndex = 0;
+int scrollX = 0; int totalTickerWidth = 0;      
+int itemWidths[50]; uint16_t itemColors[50];
+
+WiFiClientSecure secureClient;
+HTTPClient http;
+SemaphoreHandle_t dataMutex;
+
+class LGFX_Ticker : public lgfx::LGFX_Device {
+  lgfx::Panel_ST7796 _panel_instance; lgfx::Bus_SPI _bus_instance;
+public:
+  LGFX_Ticker(void) {
+    auto cfg_b = _bus_instance.config();
+    cfg_b.spi_host = SPI2_HOST; cfg_b.freq_write = 40000000; cfg_b.dma_channel = SPI_DMA_CH_AUTO;
+    cfg_b.pin_sclk = 12; cfg_b.pin_mosi = 11; cfg_b.pin_miso = -1; cfg_b.pin_dc = 9;                  
+    _bus_instance.config(cfg_b); _panel_instance.setBus(&_bus_instance);
+    auto cfg_p = _panel_instance.config();
+    cfg_p.pin_cs = 8; cfg_p.pin_rst = 10; cfg_p.pin_busy = -1;
+    cfg_p.panel_width = 320; cfg_p.panel_height = 480;  
+    cfg_p.offset_x = 0; cfg_p.offset_y = 0; cfg_p.invert = false;     
+    _panel_instance.config(cfg_p); setPanel(&_panel_instance);
+  }
+};
+LGFX_Ticker tft; LGFX_Sprite tickerSprite(&tft); 
+
+String extractToken(const String &data, int targetIndex) {
+  int currentSegment = 0, startPos = 0;
+  for (int i = 0; i <= data.length(); i++) {
+    if (i == data.length() || data.charAt(i) == ',') {
+      if (currentSegment == targetIndex) {
+        String extracted = data.substring(startPos, i);
+        extracted.trim(); return extracted;
+      }
+      startPos = i + 1; currentSegment++;
+    }
+  }
+  return "";
+}
+
+String buildNiftyItemString(int i) {
+  if (i >= niftyCount) return "";
+  bool isNegative = (niftyList[i].change.indexOf('-') != -1);
+  return niftyList[i].symbol + " " + niftyList[i].price + (isNegative ? "  v " : "  ^ ") + niftyList[i].change + " %      ";
+}
+
+void preCalculateNiftyDimensions() {
+  if (niftyCount == 0) return;
+  tft.setFont(&fonts::FreeSansBold18pt7b);
+  totalTickerWidth = 0;
+  for (int i = 0; i < niftyCount; i++) {
+    itemColors[i] = (niftyList[i].change.indexOf('-') != -1) ? 0xF806 : 0x05E5; 
+    itemWidths[i] = tft.textWidth(buildNiftyItemString(i));
+    totalTickerWidth += itemWidths[i];
+  }
+}
+
+void drawTopStaticCards() {
+  tft.startWrite();
+  tft.fillRect(0, 0, 238, 160, 0x10A2); 
+  if (babaCount > 0) {
+    Stock s = babaList[currentBabaIndex % babaCount];
+    tft.setFont(&fonts::FreeSansBold12pt7b); tft.setTextColor(TFT_SILVER); tft.drawString("BABA PORTFOLIO", 10, 10);
+    tft.setFont(&fonts::FreeSansBold18pt7b); tft.setTextColor(0x7E1F); tft.drawString(s.symbol, 10, 45); 
+    tft.setTextColor(TFT_WHITE); tft.drawString(s.price, 10, 85);
+    tft.setTextColor((s.change.indexOf('-') != -1) ? 0xF806 : 0x05E5); tft.drawString(s.change + "%", 10, 120);
+  }
+  tft.drawFastVLine(239, 0, 160, TFT_DARKGREY);
+  tft.fillRect(240, 0, 240, 160, 0x0104); 
+  if (aaiCount > 0) {
+    Stock s = aaiList[currentAaiIndex % aaiCount];
+    tft.setFont(&fonts::FreeSansBold12pt7b); tft.setTextColor(TFT_SILVER); tft.drawString("AAI PORTFOLIO", 250, 10);
+    tft.setFont(&fonts::FreeSansBold18pt7b); tft.setTextColor(0x7E1F); tft.drawString(s.symbol, 250, 45);
+    tft.setTextColor(TFT_WHITE); tft.drawString(s.price, 250, 85);
+    tft.setTextColor((s.change.indexOf('-') != -1) ? 0xF806 : 0x05E5); tft.drawString(s.change + "%", 250, 120);
+  }
+  tft.drawFastHLine(0, 161, 480, TFT_DARKGREY); tft.endWrite();
+}
+
+void processIncomingLine(const String &line, int &targetList) {
+  if (line.length() == 0 || line.indexOf("GMT") != -1 || line.startsWith("<") || line.indexOf(":") != -1) return;
+  if (line.indexOf("#NIFTY50") != -1) { targetList = 1; return; }
+  if (line.indexOf("#BABA")    != -1) { targetList = 2; return; }
+  if (line.indexOf("#AAI")     != -1) { targetList = 3; return; }
+  String sym = extractToken(line, 0), prc = extractToken(line, 1), chg = extractToken(line, 2);
+  if (sym == "" || prc == "" || chg == "") return;
+  if (targetList == 1 && shadowNiftyCount < 50) shadowNifty[shadowNiftyCount++] = {sym, prc, chg};
+  else if (targetList == 2 && shadowBabaCount < 100) shadowBaba[shadowBabaCount++] = {sym, prc, chg};
+  else if (targetList == 3 && shadowAaiCount < 100) shadowAai[shadowAaiCount++] = {sym, prc, chg};
+}
+
+void printSystemStatusDirectly(const String &msg) {
+  tft.fillScreen(TFT_BLACK); tft.setFont(&fonts::FreeSansBold12pt7b);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.setCursor(10, 140); tft.print(msg);
+}
+
+void networkBackgroundTask(void * pvParameters) {
+  for(;;) {
+    if (WiFi.status() == WL_CONNECTED) {
+      http.setTimeout(15000); http.begin(secureClient, proxyUrl); 
+      http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); 
+      int httpCode = http.GET();
+      if (httpCode == HTTP_CODE_OK) { 
+        WiFiClient* stream = http.getStreamPtr();
+        int targetList = 0; shadowNiftyCount = 0; shadowBabaCount = 0; shadowAaiCount = 0; 
+        String lineBuffer = ""; lineBuffer.reserve(64); unsigned long startTimeout = millis();
+        while ((stream->available() || http.connected()) && (millis() - startTimeout < 10000)) {
+          while (stream->available()) {
+            char c = stream->read(); startTimeout = millis(); 
+            if (c == '\n') { lineBuffer.trim(); processIncomingLine(lineBuffer, targetList); lineBuffer = ""; }
+            else if (c != '\r' && lineBuffer.length() < 60) { lineBuffer += c; }
+          }
+          vTaskDelay(1 / portTICK_PERIOD_MS);
+        }
+        if (lineBuffer.length() > 0) { lineBuffer.trim(); processIncomingLine(lineBuffer, targetList); }
+        if (shadowNiftyCount > 0 || shadowBabaCount > 0 || shadowAaiCount > 0) {
+          if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+            niftyCount = shadowNiftyCount; babaCount = shadowBabaCount; aaiCount = shadowAaiCount;
+            for (int i = 0; i < niftyCount; i++) niftyList[i] = shadowNifty[i];
+            for (int i = 0; i < babaCount; i++)  babaList[i]  = shadowBaba[i];
+            for (int i = 0; i < aaiCount; i++)   aaiList[i]   = shadowAai[i];
+            initialDataLoaded = true; 
+            dataNeedsUpdate = true; // Flag Core 1 to refresh everything safely on its own thread
+            xSemaphoreGive(dataMutex); 
+          }
+        }
+      }
+      http.end();
+    }
+    vTaskDelay(60000 / portTICK_PERIOD_MS);
+  }
+}
+
+void setup() {
+  Serial.begin(115200); tft.init(); tft.setRotation(1); tft.fillScreen(TFT_BLACK);
+  tickerSprite.setColorDepth(8); tickerSprite.createSprite(480, 60); tickerSprite.setFont(&fonts::FreeSansBold18pt7b);
+  secureClient.setInsecure(); WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { printSystemStatusDirectly("Connecting WiFi..."); delay(500); }
+  printSystemStatusDirectly("Initializing Tapes...");
+  dataMutex = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(networkBackgroundTask, "NetWorker", 8192, NULL, 1, NULL, 0);
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  if (initialDataLoaded) {
+    // FIXED: Core 1 handles drawing modifications sequentially to eliminate ghost artifacts
+    if (dataNeedsUpdate) {
+      if (xSemaphoreTake(dataMutex, 10) == pdTRUE) { 
+        tft.fillScreen(TFT_BLACK); // Clears the screen completely on the correct core thread
+        preCalculateNiftyDimensions(); 
+        drawTopStaticCards(); 
+        dataNeedsUpdate = false; 
+        xSemaphoreGive(dataMutex); 
+      }
+    }
+    if (currentMillis - lastTopSwitchTime >= 4000) {
+      if (babaCount > 0) currentBabaIndex = (currentBabaIndex + 1) % babaCount;
+      if (aaiCount > 0)  currentAaiIndex = (currentAaiIndex + 1) % aaiCount;
+      if (xSemaphoreTake(dataMutex, 5) == pdTRUE) { drawTopStaticCards(); xSemaphoreGive(dataMutex); }
+      lastTopSwitchTime = currentMillis;
+    }
+    if (niftyCount > 0 && totalTickerWidth > 0) {
+      tickerSprite.fillSprite(TFT_BLACK); int currentTextX = scrollX;
+      while (currentTextX < 480) {
+        for (int i = 0; i < niftyCount; i++) {
+          if (currentTextX + itemWidths[i] >= 0 && currentTextX < 480) {
+            tickerSprite.setTextColor(itemColors[i], TFT_BLACK); tickerSprite.drawString(buildNiftyItemString(i), currentTextX, 15);
+          }
+          currentTextX += itemWidths[i]; 
+          if (currentTextX >= 480) break; 
+        }
+      }
+      tickerSprite.pushSprite(0, 240); scrollX -= 2; 
+      if (scrollX < -totalTickerWidth) scrollX += totalTickerWidth; 
+    }
+  }
+  delay(12); 
+}
